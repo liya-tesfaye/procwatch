@@ -44,6 +44,8 @@ int main()
 	p_arr.count = 0;
     p_arr.p = malloc(p_arr.cap * sizeof(struct list));
 
+	int first_scan = 1;
+
 	while(1)
 	{
 	    arr.cap = 10;
@@ -83,7 +85,8 @@ int main()
 						if(strncmp(line, "Name:", 5) == 0)
 						{
 							strcpy(arr.p[arr.count].pid, entry->d_name);
-							strcpy(arr.p[arr.count].name, line);
+							sscanf(line, "Name:%255s", arr.p[arr.count].name);
+							//strcpy(arr.p[arr.count].name, line);
 							//printf("PID: %s -> %s\n", arr.p[arr.count].pid, arr.p[arr.count].name);
 							arr.count++;
 							break;
@@ -93,37 +96,38 @@ int main()
 				}
 			}
 
-			for(int k = 0; k < arr.count; k++)
+			if(first_scan == 0)
 			{
-				int found = 0;
-				for(int m = 0; m < p_arr.count; m++)
+				for(int k = 0; k < arr.count; k++)
 				{
-					if(strcmp(arr.p[k].pid, p_arr.p[m].pid) == 0)
+					int found = 0;
+					for(int m = 0; m < p_arr.count; m++)
 					{
-						found = 1;
-						break;
+						if(strcmp(arr.p[k].pid, p_arr.p[m].pid) == 0)
+						{
+							found = 1;
+							break;
+						}
 					}
+					if(found == 0)
+						printf("[+] New Process: %s (%s)\n", arr.p[k].pid, arr.p[k].name);
 				}
-				if(found == 0)
-					printf("[%s] new process\n", arr.p[k].pid);
-			}
 
-			for(int k = 0; k < p_arr.count; k++)
-			{
-				int exist = 0;
-				for(int m = 0; m < arr.count; m++)
+				for(int k = 0; k < p_arr.count; k++)
 				{
-					if(strcmp(p_arr.p[k].pid, arr.p[m].pid) == 0)
+					int exist = 0;
+					for(int m = 0; m < arr.count; m++)
 					{
-						exist = 1;
-						break;
+						if(strcmp(p_arr.p[k].pid, arr.p[m].pid) == 0)
+						{
+							exist = 1;
+							break;
+						}
 					}
+					if(exist == 0)
+						printf("[-] Process exited: %s (%s)\n", p_arr.p[k].pid, p_arr.p[k].name);
 				}
-				if(exist == 0)
-					printf("[%s] existed process\n", p_arr.p[k].pid);
 			}
-			
-
 			if(arr.count > p_arr.cap)
 			{
 				p_arr.cap = arr.cap;
@@ -137,9 +141,8 @@ int main()
 				strcpy(p_arr.p[i].pid,arr.p[i].pid);
 				strcpy(p_arr.p[i].name, arr.p[i].name);
 			}
-			
 			p_arr.count = arr.count;
-
+			first_scan = 0;
 		free(arr.p);
 		closedir(dir);
 		nanosleep(&ts, NULL);
