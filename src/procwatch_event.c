@@ -8,13 +8,44 @@
 #include <unistd.h>
 #include <asm/types.h>
 #include <sys/socket.h>
+#include <sys/inotify.h>
+#include <sys/select.h>
 #include <linux/netlink.h>
 #include <linux/connector.h>
 #include <linux/cn_proc.h>
 
+/* ------------------------------------------------------------------ */
+/*  Configuration                                                       */
+/* ------------------------------------------------------------------ */
+
 #define INITIAL_CAP 10
 
-struct list {
+static const char *WATCH_DIRS[] = {
+    "/tmp",
+    "/etc",
+    "/bin",
+    "/usr/bin",
+    NULL   /* sentinel — add new paths here, nothing else needs changing */
+};
+
+/* Processes whose entire subtree we suppress.
+ * If any ancestor of a new process matches one of these names, the
+ * event is dropped.  Add noisy parents here — do NOT remove entries,
+ * because that would re-introduce noise in the demo.                  */
+static const char *SUPPRESS_ANCESTORS[] = {
+    "code",           /* VS Code main process                          */
+    "code-oss",       /* VS Code open-source build                     */
+    "electron",       /* Electron shell (VS Code, etc.)                */
+    "chrome",         /* Chrome / Chromium                             */
+    "firefox",        /* Firefox                                       */
+    NULL
+};
+
+/* ------------------------------------------------------------------ */
+/*  Data structures                                                     */
+/* ------------------------------------------------------------------ */
+
+struct proc_info {
     char pid[16];
     char name[256];
     char ppid[16];
@@ -22,229 +53,234 @@ struct list {
     char cmdline[1024];
 };
 
-struct box {
-    struct list *p;
+struct proc_cache {
+    struct proc_info *entries;
     int cap;
     int count;
 };
 
-/* ---------- small helpers ---------- */
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                             */
+/* ------------------------------------------------------------------ */
 
-int is_num(char *name)
+static int is_num(const char *s)
 {
-    int i = 0;
-    while(name[i] != '\0')
+    if(*s == '\0') return 0;
+    while(*s)
     {
-        if(isdigit((unsigned char)name[i]) == 0)
-            return 0;
-        i++;
+        if(!isdigit((unsigned char)*s)) return 0;
+        s++;
     }
     return 1;
 }
 
-void print_json_str(const char *s)
+/* Write a JSON-safe string to stdout — escapes the five characters
+ * that would otherwise break a JSON parser.                           */
+static void emit_json_str(const char *s)
 {
     while(*s)
     {
-        if(*s == '"')       printf("\\\"");
-        else if(*s == '\\') printf("\\\\");
-        else if(*s == '\n') printf("\\n");
-        else if(*s == '\r') printf("\\r");
-        else if(*s == '\t') printf("\\t");
-        else                putchar(*s);
+        switch(*s)
+        {
+            case '"':  printf("\\\""); break;
+            case '\\': printf("\\\\"); break;
+            case '\n': printf("\\n");  break;
+            case '\r': printf("\\r");  break;
+            case '\t': printf("\\t");  break;
+            default:   putchar(*s);   break;
+        }
         s++;
     }
 }
 
-long now_seconds(void)
+static long now_seconds(void)
 {
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-    return (long)now.tv_sec;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long)ts.tv_sec;
 }
 
-/* ---------- box (dynamic array) management ---------- */
+/* ------------------------------------------------------------------ */
+/*  Cache management                                                    */
+/* ------------------------------------------------------------------ */
 
-void box_init(struct box *b, int cap)
+static int cache_init(struct proc_cache *c, int cap)
 {
-    b->cap = cap;
-    b->count = 0;
-    b->p = malloc(cap * sizeof(struct list));
-}
-
-int box_ensure_capacity(struct box *b)
-{
-    if(b->count < b->cap)
-        return 1;
-
-    int new_cap = b->cap * 2;
-    struct list *temp = realloc(b->p, new_cap * sizeof(struct list));
-    if(temp == NULL)
-    {
-        free(b->p);
-        fprintf(stderr, "realloc failed\n");
-        return 0;
-    }
-    b->p = temp;
-    b->cap = new_cap;
+    c->entries = malloc((size_t)cap * sizeof(struct proc_info));
+    if(!c->entries) return 0;
+    c->cap   = cap;
+    c->count = 0;
     return 1;
 }
 
-void box_free(struct box *b)
+static int cache_grow(struct proc_cache *c)
 {
-    free(b->p);
-    b->p = NULL;
-    b->cap = 0;
-    b->count = 0;
+    if(c->count < c->cap) return 1;
+
+    int new_cap = c->cap * 2;
+    struct proc_info *tmp = realloc(c->entries,
+                                    (size_t)new_cap * sizeof(struct proc_info));
+    if(!tmp)
+    {
+        free(c->entries);
+        c->entries = NULL;
+        fprintf(stderr, "sentineledr: realloc failed\n");
+        return 0;
+    }
+    c->entries = tmp;
+    c->cap     = new_cap;
+    return 1;
 }
 
-void box_remove_at(struct box *b, int idx)
+static void cache_free(struct proc_cache *c)
 {
-    if(idx < 0 || idx >= b->count)
-        return;
-    b->p[idx] = b->p[b->count - 1];
-    b->count--;
+    free(c->entries);
+    c->entries = NULL;
+    c->cap = c->count = 0;
 }
 
-/* ---------- reading /proc/<pid> data ---------- */
+static int cache_find(struct proc_cache *c, const char *pid)
+{
+    for(int i = 0; i < c->count; i++)
+        if(strcmp(c->entries[i].pid, pid) == 0) return i;
+    return -1;
+}
 
-int read_proc_status(const char *pid_str, struct list *entry)
+/* Swap-with-last removal — O(1), order not preserved (fine for a cache) */
+static void cache_remove(struct proc_cache *c, int idx)
+{
+    if(idx < 0 || idx >= c->count) return;
+    c->entries[idx] = c->entries[c->count - 1];
+    c->count--;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Noise filter                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Walk the ancestor chain of `pid` (via the cache) and return 1 if
+ * any ancestor's name matches SUPPRESS_ANCESTORS.
+ * Stops after 16 hops to avoid infinite loops on pid 1.              */
+static int should_suppress(const char *ppid_str, const struct proc_cache *c)
+{
+    char cur[16];
+    strncpy(cur, ppid_str, sizeof(cur) - 1);
+    cur[sizeof(cur) - 1] = '\0';
+
+    for(int hop = 0; hop < 16; hop++)
+    {
+        if(strcmp(cur, "0") == 0 || strcmp(cur, "1") == 0) break;
+
+        int idx = cache_find((struct proc_cache *)c, cur);
+        if(idx < 0) break;
+
+        const char *aname = c->entries[idx].name;
+        for(int i = 0; SUPPRESS_ANCESTORS[i] != NULL; i++)
+            if(strncmp(aname, SUPPRESS_ANCESTORS[i],
+                       strlen(SUPPRESS_ANCESTORS[i])) == 0)
+                return 1;
+
+        strncpy(cur, c->entries[idx].ppid, sizeof(cur) - 1);
+        cur[sizeof(cur) - 1] = '\0';
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  /proc enrichment                                                    */
+/* ------------------------------------------------------------------ */
+
+static int read_proc_status(const char *pid_str, struct proc_info *out)
 {
     char path[512];
     snprintf(path, sizeof(path), "/proc/%s/status", pid_str);
 
     FILE *f = fopen(path, "r");
-    if(f == NULL)
-        return 0; /* process already gone - expected and fine, caller handles it */
+    if(!f) return 0;   /* process already gone — caller handles it */
 
     int got_name = 0, got_ppid = 0, got_uid = 0;
     char line[256];
 
     while(fgets(line, sizeof(line), f))
     {
-        if(strncmp(line, "Name:", 5) == 0)
+        if     (!got_name && strncmp(line, "Name:", 5) == 0)
         {
-            sscanf(line, "Name: %255s", entry->name);
-            strncpy(entry->pid, pid_str, sizeof(entry->pid) - 1);
-            entry->pid[sizeof(entry->pid) - 1] = '\0';
+            sscanf(line, "Name: %255s", out->name);
+            strncpy(out->pid, pid_str, sizeof(out->pid) - 1);
+            out->pid[sizeof(out->pid) - 1] = '\0';
             got_name = 1;
         }
-        else if(strncmp(line, "PPid:", 5) == 0)
+        else if(!got_ppid && strncmp(line, "PPid:", 5) == 0)
         {
-            sscanf(line, "PPid: %15s", entry->ppid);
+            sscanf(line, "PPid: %15s", out->ppid);
             got_ppid = 1;
         }
-        else if(strncmp(line, "Uid:", 4) == 0)
+        else if(!got_uid && strncmp(line, "Uid:", 4) == 0)
         {
-            sscanf(line, "Uid: %15s", entry->uid);
+            sscanf(line, "Uid: %15s", out->uid);
             got_uid = 1;
         }
-        if(got_name && got_ppid && got_uid)
-            break;
+        if(got_name && got_ppid && got_uid) break;
     }
     fclose(f);
     return 1;
 }
 
-void read_proc_cmdline(const char *pid_str, struct list *entry)
+static void read_proc_cmdline(const char *pid_str, struct proc_info *out)
 {
-    char cmd_path[512];
-    snprintf(cmd_path, sizeof(cmd_path), "/proc/%s/cmdline", pid_str);
+    char path[512];
+    snprintf(path, sizeof(path), "/proc/%s/cmdline", pid_str);
 
-    FILE *cf = fopen(cmd_path, "r");
-    if(cf == NULL)
-        return;
+    FILE *f = fopen(path, "r");
+    if(!f) return;
 
-    int len = fread(entry->cmdline, 1, sizeof(entry->cmdline) - 1, cf);
-    fclose(cf);
+    int len = (int)fread(out->cmdline, 1, sizeof(out->cmdline) - 1, f);
+    fclose(f);
 
     if(len > 0)
     {
-        entry->cmdline[len] = '\0';
+        out->cmdline[len] = '\0';
+        /* /proc/PID/cmdline separates argv entries with NUL bytes —
+         * replace them with spaces so the field is a readable string. */
         for(int i = 0; i < len - 1; i++)
-        {
-            if(entry->cmdline[i] == '\0')
-                entry->cmdline[i] = ' ';
-        }
+            if(out->cmdline[i] == '\0') out->cmdline[i] = ' ';
     }
     else
     {
-        strncpy(entry->cmdline, entry->name, sizeof(entry->cmdline) - 1);
-        entry->cmdline[sizeof(entry->cmdline) - 1] = '\0';
+        /* Kernel threads have an empty cmdline — fall back to name.  */
+        strncpy(out->cmdline, out->name, sizeof(out->cmdline) - 1);
+        out->cmdline[sizeof(out->cmdline) - 1] = '\0';
     }
 }
 
-int find_by_pid(struct box *b, const char *pid)
-{
-    for(int i = 0; i < b->count; i++)
-    {
-        if(strcmp(b->p[i].pid, pid) == 0)
-            return i;
-    }
-    return -1;
-}
+/* ------------------------------------------------------------------ */
+/*  Startup cache seed                                                  */
+/* ------------------------------------------------------------------ */
 
-void print_start_event(struct list *proc)
-{
-    long ts = now_seconds();
-    printf("{\"event\":\"process_start\",\"pid\":%s,\"name\":\"", proc->pid);
-    print_json_str(proc->name);
-    printf("\",\"ppid\":%s,\"uid\":%s,\"cmdline\":\"", proc->ppid, proc->uid);
-    print_json_str(proc->cmdline);
-    printf("\",\"ts\":%ld}\n", ts);
-    fflush(stdout);
-}
-
-void print_exit_event(struct list *proc)
-{
-    long ts = now_seconds();
-    printf("{\"event\":\"process_exit\",\"pid\":%s,\"name\":\"", proc->pid);
-    print_json_str(proc->name);
-    printf("\",\"ppid\":%s,\"uid\":%s,\"ts\":%ld}\n", proc->ppid, proc->uid, ts);
-    fflush(stdout);
-}
-
-/* ---------- NEW: one-time initial /proc scan ----------
- *
- * This is NOT polling - it runs exactly once, at startup, before the
- * netlink loop begins. Its only job is to seed `cache` with processes
- * that were already running before this agent started, so that if one
- * of them exits later, PROC_EVENT_EXIT can still find a cached
- * name/ppid/uid for it instead of printing nothing.
- *
- * It deliberately does NOT print process_start events for these -
- * they didn't just start, your agent just started watching. If you
- * want a "process already running at agent startup" event type,
- * that's a one-line addition in the loop below, kept separate on
- * purpose so "process_start" always means "actually just started."
- */
-int seed_cache_from_proc(struct box *cache)
+/* Runs ONCE before the event loop.  Seeds the cache with processes
+ * that were already running so EXIT events for them can be enriched.
+ * No process_start events are emitted — these processes didn't just
+ * start, the agent just started watching.                             */
+static int seed_cache(struct proc_cache *cache)
 {
     DIR *dir = opendir("/proc");
-    if(dir == NULL)
+    if(!dir)
     {
-        fprintf(stderr, "Couldn't open /proc for initial scan\n");
+        fprintf(stderr, "sentineledr: cannot open /proc\n");
         return 0;
     }
 
-    struct dirent *entry;
-    while((entry = readdir(dir)) != NULL)
+    struct dirent *ent;
+    while((ent = readdir(dir)) != NULL)
     {
-        if(!is_num(entry->d_name))
-            continue;
+        if(!is_num(ent->d_name)) continue;
+        if(!cache_grow(cache))  { closedir(dir); return 0; }
 
-        if(!box_ensure_capacity(cache))
-        {
-            closedir(dir);
-            return 0;
-        }
+        struct proc_info *slot = &cache->entries[cache->count];
+        memset(slot, 0, sizeof(*slot));
 
-        struct list *slot = &cache->p[cache->count];
-
-        if(!read_proc_status(entry->d_name, slot))
-            continue; /* gone before we got to it - fine, skip */
-
-        read_proc_cmdline(entry->d_name, slot);
+        if(!read_proc_status(ent->d_name, slot)) continue;
+        read_proc_cmdline(ent->d_name, slot);
         cache->count++;
     }
 
@@ -252,12 +288,69 @@ int seed_cache_from_proc(struct box *cache)
     return 1;
 }
 
-/* ---------- netlink PROC_EVENTS ---------- */
+/* ------------------------------------------------------------------ */
+/*  JSON emitters — stdout only, always flushed                        */
+/* ------------------------------------------------------------------ */
+
+static void emit_process_start(const struct proc_info *p)
+{
+    printf("{\"event\":\"process_start\","
+           "\"pid\":%s,\"name\":\"", p->pid);
+    emit_json_str(p->name);
+    printf("\",\"ppid\":%s,\"uid\":%s,\"cmdline\":\"",
+           p->ppid, p->uid);
+    emit_json_str(p->cmdline);
+    printf("\",\"ts\":%ld}\n", now_seconds());
+    fflush(stdout);
+}
+
+static void emit_process_exit(const struct proc_info *p)
+{
+    printf("{\"event\":\"process_exit\","
+           "\"pid\":%s,\"name\":\"", p->pid);
+    emit_json_str(p->name);
+    printf("\",\"ppid\":%s,\"uid\":%s,\"ts\":%ld}\n",
+           p->ppid, p->uid, now_seconds());
+    fflush(stdout);
+}
+
+/* Maps an inotify mask to a short event-type string */
+static const char *inotify_event_name(uint32_t mask)
+{
+    if(mask & IN_CREATE)      return "file_create";
+    if(mask & IN_DELETE)      return "file_delete";
+    if(mask & IN_CLOSE_WRITE) return "file_write";
+    if(mask & IN_MOVED_FROM)  return "file_moved_from";
+    if(mask & IN_MOVED_TO)    return "file_moved_to";
+    return "file_event";
+}
+
+static void emit_file_event(const char *dir, const struct inotify_event *ie)
+{
+    /* Skip events with no filename (happens for watches on plain files) */
+    if(ie->len == 0) return;
+
+    const char *type = inotify_event_name(ie->mask);
+    int is_dir       = (ie->mask & IN_ISDIR) ? 1 : 0;
+
+    printf("{\"event\":\"%s\",\"path\":\"", type);
+    emit_json_str(dir);
+    printf("/");
+    emit_json_str(ie->name);
+    printf("\",\"is_dir\":%s,\"ts\":%ld}\n",
+           is_dir ? "true" : "false",
+           now_seconds());
+    fflush(stdout);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Netlink setup                                                       */
+/* ------------------------------------------------------------------ */
 
 struct proc_subscribe_msg {
     struct nlmsghdr nl_hdr;
     struct __attribute__((__packed__)) {
-        struct cn_msg cn_msg;
+        struct cn_msg        cn_msg;
         enum proc_cn_mcast_op cn_mcast;
     };
 } __attribute__((aligned(NLMSG_ALIGNTO)));
@@ -265,155 +358,240 @@ struct proc_subscribe_msg {
 struct proc_event_msg {
     struct nlmsghdr nl_hdr;
     struct __attribute__((__packed__)) {
-        struct cn_msg cn_msg;
+        struct cn_msg    cn_msg;
         struct proc_event proc_ev;
     };
 } __attribute__((aligned(NLMSG_ALIGNTO)));
 
-int netlink_proc_open(void)
+static int netlink_open(void)
 {
-    int sock_fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
-    if(sock_fd == -1)
-    {
-        perror("socket");
-        return -1;
-    }
+    int fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
+    if(fd == -1) { perror("socket"); return -1; }
 
-    struct sockaddr_nl addr;
-    memset(&addr, 0, sizeof(addr));
+    struct sockaddr_nl addr = {0};
     addr.nl_family = AF_NETLINK;
-    addr.nl_pid = getpid();
+    addr.nl_pid    = (unsigned)getpid();
     addr.nl_groups = CN_IDX_PROC;
 
-    if(bind(sock_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
+    if(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
     {
         perror("bind");
-        close(sock_fd);
+        close(fd);
         return -1;
     }
 
-    struct proc_subscribe_msg msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.nl_hdr.nlmsg_len = sizeof(msg);
-    msg.nl_hdr.nlmsg_pid = getpid();
-    msg.nl_hdr.nlmsg_type = NLMSG_DONE;
-    msg.cn_msg.id.idx = CN_IDX_PROC;
-    msg.cn_msg.id.val = CN_VAL_PROC;
-    msg.cn_msg.len = sizeof(enum proc_cn_mcast_op);
-    msg.cn_mcast = PROC_CN_MCAST_LISTEN;
+    struct proc_subscribe_msg sub = {0};
+    sub.nl_hdr.nlmsg_len  = sizeof(sub);
+    sub.nl_hdr.nlmsg_pid  = (unsigned)getpid();
+    sub.nl_hdr.nlmsg_type = NLMSG_DONE;
+    sub.cn_msg.id.idx     = CN_IDX_PROC;
+    sub.cn_msg.id.val     = CN_VAL_PROC;
+    sub.cn_msg.len        = sizeof(enum proc_cn_mcast_op);
+    sub.cn_mcast          = PROC_CN_MCAST_LISTEN;
 
-    if(send(sock_fd, &msg, sizeof(msg), 0) == -1)
+    if(send(fd, &sub, sizeof(sub), 0) == -1)
     {
         perror("send (subscribe)");
-        close(sock_fd);
+        close(fd);
         return -1;
     }
 
-    return sock_fd;
+    return fd;
 }
 
-/* ---------- main: netlink drives it, /proc only enriches ---------- */
+/* ------------------------------------------------------------------ */
+/*  Inotify setup                                                       */
+/* ------------------------------------------------------------------ */
 
-int main(void)
+/* Returns the inotify fd, populates wd_out[] with one watch descriptor
+ * per entry in WATCH_DIRS (matched by index).                         */
+static int inotify_open(int *wd_out)
 {
-    struct box cache;
-    box_init(&cache, INITIAL_CAP);
+    int fd = inotify_init1(IN_NONBLOCK);
+    if(fd == -1) { perror("inotify_init1"); return -1; }
 
-    if(!seed_cache_from_proc(&cache))
+    for(int i = 0; WATCH_DIRS[i] != NULL; i++)
     {
-        box_free(&cache);
-        return 1;
+        wd_out[i] = inotify_add_watch(fd, WATCH_DIRS[i],
+                        IN_CREATE      |
+                        IN_DELETE      |
+                        IN_MOVED_FROM  |
+                        IN_MOVED_TO    |
+                        IN_CLOSE_WRITE);
+
+        if(wd_out[i] == -1)
+            fprintf(stderr, "sentineledr: cannot watch %s: %m\n",
+                    WATCH_DIRS[i]);
     }
 
-    int sock_fd = netlink_proc_open();
-    if(sock_fd == -1)
-    {
-        box_free(&cache);
-        return 1;
-    }
+    return fd;
+}
 
-    printf("Subscribed. Waiting for kernel-pushed process events...\n");
-    fflush(stdout);
+/* Resolve a watch descriptor back to the directory path it covers.   */
+static const char *wd_to_dir(const int *wds, int wd)
+{
+    for(int i = 0; WATCH_DIRS[i] != NULL; i++)
+        if(wds[i] == wd) return WATCH_DIRS[i];
+    return "(unknown)";
+}
 
-    struct proc_event_msg msg;
+/* ------------------------------------------------------------------ */
+/*  Inotify event draining                                              */
+/* ------------------------------------------------------------------ */
+
+/* inotify can batch multiple events in one read — drain the whole
+ * buffer and emit a JSON line for each one.                           */
+static void drain_inotify(int ifd, const int *wds)
+{
+    /* Buffer sized to hold several events; inotify_event has a
+     * variable-length name field so we cast after alignment.          */
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
 
     while(1)
     {
-        ssize_t recv_len = recv(sock_fd, &msg, sizeof(msg), 0);
-        if(recv_len == -1)
+        ssize_t len = read(ifd, buf, sizeof(buf));
+        if(len == -1) break;   /* EAGAIN/EWOULDBLOCK — buffer drained */
+
+        const char *ptr = buf;
+        const char *end = buf + len;
+
+        while(ptr < end)
         {
-            perror("recv");
-            break;
+            const struct inotify_event *ie =
+                (const struct inotify_event *)ptr;
+
+            emit_file_event(wd_to_dir(wds, ie->wd), ie);
+
+            ptr += sizeof(struct inotify_event) + ie->len;
         }
-        if(recv_len == 0)
-            break;
+    }
+}
 
-        struct proc_event *ev = &msg.proc_ev;
+/* ------------------------------------------------------------------ */
+/*  Netlink event handling                                              */
+/* ------------------------------------------------------------------ */
 
-        if(ev->what == PROC_EVENT_EXEC)
+static void handle_netlink(int sock_fd, struct proc_cache *cache)
+{
+    struct proc_event_msg msg;
+    ssize_t recv_len = recv(sock_fd, &msg, sizeof(msg), 0);
+    if(recv_len <= 0) return;
+
+    struct proc_event *ev = &msg.proc_ev;
+
+    if(ev->what == PROC_EVENT_EXEC)
+    {
+        char pid_str[16];
+        snprintf(pid_str, sizeof(pid_str), "%d",
+                 ev->event_data.exec.process_pid);
+
+        struct proc_info fresh = {0};
+        if(!read_proc_status(pid_str, &fresh)) return;
+        read_proc_cmdline(pid_str, &fresh);
+
+        /* Upsert into cache so a later EXIT has context.
+         * We cache BEFORE the suppress check so that even suppressed
+         * processes are tracked — their children need ancestor lookups. */
+        int idx = cache_find(cache, pid_str);
+        if(idx >= 0)
+            cache->entries[idx] = fresh;
+        else
         {
-            pid_t pid = ev->event_data.exec.process_pid;
-            char pid_str[16];
-            snprintf(pid_str, sizeof(pid_str), "%d", pid);
-
-            struct list fresh = {0};
-            if(!read_proc_status(pid_str, &fresh))
-            {
-                continue;
-            }
-            read_proc_cmdline(pid_str, &fresh);
-
-            /* Update-or-insert into the cache so a later EXIT can
-             * find this pid's details.
-             */
-            int idx = find_by_pid(&cache, pid_str);
-            if(idx >= 0)
-            {
-                cache.p[idx] = fresh;
-            }
-            else
-            {
-                if(!box_ensure_capacity(&cache))
-                {
-                    box_free(&cache);
-                    close(sock_fd);
-                    return 1;
-                }
-                cache.p[cache.count] = fresh;
-                cache.count++;
-            }
-
-            print_start_event(&fresh);
+            if(!cache_grow(cache)) return;
+            cache->entries[cache->count++] = fresh;
         }
-        else if(ev->what == PROC_EVENT_EXIT)
+
+        /* Drop events whose ancestor tree contains a suppressed process */
+        if(should_suppress(fresh.ppid, cache)) return;
+
+        emit_process_start(&fresh);
+    }
+    else if(ev->what == PROC_EVENT_EXIT)
+    {
+        char pid_str[16];
+        snprintf(pid_str, sizeof(pid_str), "%d",
+                 ev->event_data.exit.process_pid);
+
+        int idx = cache_find(cache, pid_str);
+        if(idx >= 0)
         {
-            pid_t pid = ev->event_data.exit.process_pid;
-            char pid_str[16];
-            snprintf(pid_str, sizeof(pid_str), "%d", pid);
-
-            int idx = find_by_pid(&cache, pid_str);
-            if(idx >= 0)
-            {
-                print_exit_event(&cache.p[idx]);
-                box_remove_at(&cache, idx);
-            }
-            else
-            {
-                printf("{\"event\":\"process_exit\",\"pid\":\"%s\",\"ts\":%ld}\n",
-                       pid_str, now_seconds());
-                fflush(stdout);
-            }
+            if(!should_suppress(cache->entries[idx].ppid, cache))
+                emit_process_exit(&cache->entries[idx]);
+            cache_remove(cache, idx);
         }
-        /* PROC_EVENT_FORK is deliberately ignored here: the process
-         * usually hasn't exec'd its real binary yet, so /proc/<pid>
-         * would show it still looking like its parent. Waiting for
-         * EXEC gives you accurate name/cmdline. If you need to catch
-         * processes that fork and never exec, add a FORK case that
-         * enriches from /proc but expect name==parent's name.
-         */
+        /* Rare uncached exits: silently drop — no name/ppid to check,
+         * and they're almost always from suppressed subtrees anyway.   */
+    }
+    /* PROC_EVENT_FORK intentionally skipped — the child hasn't exec'd
+     * yet so /proc still shows the parent's name. EXEC arrives next
+     * and gives accurate data. Add a FORK case only if you need to
+     * catch processes that fork-and-never-exec (rare, mostly threads). */
+}
+
+/* ------------------------------------------------------------------ */
+/*  main                                                                */
+/* ------------------------------------------------------------------ */
+
+int main(void)
+{
+    /* --- cache ---------------------------------------------------- */
+    struct proc_cache cache;
+    if(!cache_init(&cache, INITIAL_CAP))
+    {
+        fprintf(stderr, "sentineledr: out of memory\n");
+        return 1;
+    }
+    if(!seed_cache(&cache))
+    {
+        cache_free(&cache);
+        return 1;
     }
 
+    /* --- netlink -------------------------------------------------- */
+    int sock_fd = netlink_open();
+    if(sock_fd == -1)
+    {
+        cache_free(&cache);
+        return 1;
+    }
+
+    /* --- inotify -------------------------------------------------- */
+    /* One watch descriptor per directory in WATCH_DIRS.              */
+    int wds[sizeof(WATCH_DIRS) / sizeof(WATCH_DIRS[0])] = {0};
+    int ifd = inotify_open(wds);
+    if(ifd == -1)
+    {
+        close(sock_fd);
+        cache_free(&cache);
+        return 1;
+    }
+
+    /* --- event loop ----------------------------------------------- */
+    int maxfd = sock_fd > ifd ? sock_fd : ifd;
+
+    while(1)
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock_fd, &rfds);
+        FD_SET(ifd,     &rfds);
+
+        if(select(maxfd + 1, &rfds, NULL, NULL, NULL) == -1)
+        {
+            perror("select");
+            break;
+        }
+
+        if(FD_ISSET(sock_fd, &rfds))
+            handle_netlink(sock_fd, &cache);
+
+        if(FD_ISSET(ifd, &rfds))
+            drain_inotify(ifd, wds);
+    }
+
+    /* --- cleanup -------------------------------------------------- */
+    close(ifd);
     close(sock_fd);
-    box_free(&cache);
+    cache_free(&cache);
     return 0;
 }
