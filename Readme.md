@@ -1,57 +1,65 @@
 # ProcWatch
 
-A lightweight host-based intrusion detection agent for Linux.
+Event-driven Linux process and filesystem telemetry agent, written in C.
 
-## Overview
+ProcWatch monitors live system activity by tapping directly into the Linux kernel's event-notification interfaces — rather than polling — to detect process lifecycle events and filesystem changes in real time.
 
-ProcWatch is a lightweight Linux process monitoring agent written in C. It scans the `/proc` filesystem every 500ms to track active processes and detect changes in the system process list. Events are output as structured JSON for easy parsing and integration.
+## Features
 
-## Current Status (Week 1)
+- **Netlink process event monitoring** — subscribes to the kernel's process connector (`NETLINK_CONNECTOR`) to receive fork/exec/exit events as they happen, with no polling delay
+- **inotify filesystem monitoring** — watches target directories for file creation, modification, and deletion events
+- **Unified event loop** — multiplexes both event sources (Netlink socket + inotify file descriptor) through a single `select()` loop
+- **Process enrichment via `/proc`** — for each event, resolves executable path, parent PID, UID, and full command-line arguments from `/proc/[pid]/`
+- **Structured JSON output** — every event is emitted as a structured JSON record, ready to feed into a log pipeline, SIEM, or downstream monitoring tool
 
-### Initial foundation
-- Reads `/proc/[pid]/status` for active processes
-- Extracts PID and process name
-- Polls the system every 500ms
-- Detects newly created and exited processes
-- Outputs events to stdout
+## How It Works
 
-### Week 1 improvements
-- Added `PPid` and `Uid` fields read from `/proc/[pid]/status`
-- Added full command line read from `/proc/[pid]/cmdline` using `fread` (handles null-separated arguments)
-- Added Unix timestamps to every event via `clock_gettime`
-- Switched output from plain text to structured JSON:
-```json
-{"event":"process_start","pid":1234,"name":"bash","ppid":998,"uid":1000,"cmdline":"bash","ts":1748822400}
-{"event":"process_exit","pid":1234,"name":"bash","ppid":998,"uid":1000,"ts":1748822401}
-```
-- Fixed `realloc` bug: now returns error instead of falling through on NULL
-- Replaced all `strcpy` with `strncpy` and explicit null termination
-- Fixed `arr.count++` and `fclose` placement (were incorrectly inside the `fgets` loop)
-- Added `_POSIX_C_SOURCE 199309L` for portable POSIX compliance
+1. Opens a Netlink socket bound to the kernel's process connector and subscribes to process events (`PROC_EVENT_FORK`, `PROC_EVENT_EXEC`, `PROC_EVENT_EXIT`)
+2. Sets up `inotify` watches on configured directories
+3. Runs a single-threaded `select()` loop multiplexing both file descriptors — no busy-waiting, no polling interval
+4. On each event, enriches the raw PID/event data by reading `/proc/[pid]/status`, `/proc/[pid]/cmdline`, and `/proc/[pid]/exe`
+5. Emits a structured JSON record per event to stdout (pipeable to a log collector)
 
 ## Build
 
 ```bash
-gcc -Wall -Wextra -o proc_scanner src/proc_scanner.c
+gcc -o procwatch src/procwatch.c
 ```
 
-## Run
+## Usage
 
 ```bash
-./proc_scanner          # plain JSON output
-./proc_scanner | jq .   # pretty-printed
+sudo ./procwatch
 ```
 
-## Install
+Requires root privileges to open the Netlink process-connector socket.
 
-```bash
-sudo mv proc_scanner /usr/local/bin/
-sudo chmod +x /usr/local/bin/proc_scanner
+## Example Output
+
+```json
+{
+  "event": "exec",
+  "pid": 4821,
+  "ppid": 4790,
+  "uid": 1000,
+  "exe": "/usr/bin/python3",
+  "cmdline": "python3 scanner.py"
+}
 ```
 
-## Notes
+## Tech Stack
 
-- Uses polling-based monitoring of `/proc` — no kernel modules required
-- Maintains two in-memory snapshots and diffs them each interval
-- Kernel threads (empty cmdline) fall back to process name
-- Designed for Linux only
+- C
+- Linux Netlink sockets (`NETLINK_CONNECTOR`)
+- inotify
+- POSIX (`select()`, `/proc` filesystem)
+
+## Roadmap
+
+- [ ] eBPF-based syscall interception (replacing/augmenting Netlink for finer-grained visibility)
+- [ ] Attack simulation module mapped to MITRE ATT&CK (privilege escalation, process injection, lateral movement)
+- [ ] Configurable output sinks (file, syslog, network socket)
+
+## Author
+
+**Liya Tesfaye**
